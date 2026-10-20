@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Go Fish</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#021526">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #021526; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; touch-action: none; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; border-radius: 12px; box-shadow: 0 0 40px rgba(0, 180, 255, 0.25); cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Go Fish game"></canvas>
+<script src="characters.js"></script>
+<script>
+"use strict";
+
+// ===== Config =====
+const W = 420, H = 720, GROUND = 70;
+const STEP = 1 / 120;                       // fixed physics step (seconds)
+const GRAVITY = 1150, SWIM = -390, MAX_FALL = 520;
+const SPEED = 150, SPACING = 240, OBS_W = 72, GAP = 190;
+const FISH_X = 120, FISH_R = 15;
+const PEARL_CHANCE = 1 / 3, PEARL_R = 9, PEARL_POINTS = 3;
+const RESTART_DELAY = 0.6;
+const MUTE_BTN = { x: W - 52, y: 14, w: 38, h: 38 };
+const RAMP_SCORE = 60, LEVEL_EVERY = 10;             // difficulty climbs until this score, banner every 10
+const MAX_SPEED_MULT = 1.45, MIN_GAP = 145;
+const SHARK_MIN_SCORE = 5, SHARK_WARN = 1.2, SHARK_SPEED_MULT = 2.5;
+const SHARK_FIRST = [2, 4], SHARK_EVERY = [8, 14];   // seconds between sharks
+const SHARK_HITBOX = [[-30, 13], [-2, 17], [26, 12]]; // [x offset, radius] circles along the body
+const SWALLOW_TIME = 0.15, EATEN_PANEL_DELAY = 0.8;   // let the player watch the chomp
+const POWER_PEARLS = 3, SHARK_EAT_POINTS = 10;       // pearl power: a full meter lets you eat the next shark
+const GULP_TIME = 0.35, BULGE_TIME = 0.4;
+
+// ===== Safe storage (works even when localStorage is blocked) =====
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } }
+};
+
+// ===== Helpers =====
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// ===== Difficulty ramp (0 = start, 1 = max at RAMP_SCORE) =====
+const difficulty = () => clamp(score / RAMP_SCORE, 0, 1);
+const speed = () => SPEED * (1 + (MAX_SPEED_MULT - 1) * difficulty());
+const gapSize = () => GAP - (GAP - MIN_GAP) * difficulty();
+const sharkWarnTime = () => SHARK_WARN - 0.3 * difficulty();
+const sharkInterval = () => rand(...SHARK_EVERY) * (1 - 0.3 * difficulty());
+
+// ===== State =====
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let best = parseInt(store.get('fishyDash.best', '0'), 10) || 0;
+let muted = store.get('fishyDash.muted', '0') === '1';
+if (CHARACTERS[store.get('fishyDash.char', '')]) charId = store.get('fishyDash.char', '');
+let state = 'menu';                          // menu | play | over
+let fish, obstacles, particles, popups, score, newBest, overTime, nextGapY;
+let shark, sharkTimer, crashCause, shakeT = 0, pearls = 0, level = 0, bannerT = 0;
+const isCharged = () => pearls >= POWER_PEARLS;
+let time = 0, groundX = 0;
+
+function makeBubble(anywhere) {
+  return { x: rand(0, W), y: anywhere ? rand(0, H - GROUND) : H - GROUND, r: rand(1.5, 5), speed: rand(20, 60), phase: rand(0, 6.28) };
+}
+const bubbles = Array.from({ length: 28 }, () => makeBubble(true));
+
+function reset() {
+  fish = { y: H * 0.42, vy: 0, angle: 0, tail: 0, dead: false, eaten: false, eatenT: 0, mouth: 0, bulge: 0 };
+  shakeT = 0; pearls = 0; level = 0; bannerT = 0;
+  resetAbility();
+  obstacles = []; particles = []; popups = [];
+  score = 0; newBest = false;
+  shark = null; sharkTimer = rand(...SHARK_FIRST); crashCause = 'crash';
+  nextGapY = (H - GROUND) / 2;
+  spawnObstacle(W + 60);
+}
+
+function spawnObstacle(x) {
+  const gap = gapSize();                       // each obstacle keeps the gap it was born with
+  const min = gap / 2 + 50, max = H - GROUND - gap / 2 - 50;
+  const shift = 200 - 50 * difficulty();       // less time between pipes at speed, so smaller height jumps
+  nextGapY = clamp(nextGapY + rand(-shift, shift), min, max);
+  const pearl = Math.random() < PEARL_CHANCE
+    ? { dy: (Math.random() < 0.5 ? -1 : 1) * rand(20, gap / 2 - 30), taken: false }
+    : null;
+  obstacles.push({ x, gap, gapY: nextGapY, passed: false, pearl });
+}
+
+// ===== Sound (Web Audio, generated in code) =====
+let actx = null;
+function initAudio() {
+  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch { actx = null; } }
+  if (actx && actx.state === 'suspended') actx.resume();
+}
+function tone(type, f1, f2, dur, vol, delay = 0) {
+  if (muted || !actx) return;
+  const t = actx.currentTime + delay;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f1, t);
+  o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(actx.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+const sfx = {
+  swim:  () => tone('sine', 260, 620, 0.12, 0.18),
+  point: () => { tone('sine', 880, 880, 0.08, 0.12); tone('sine', 1320, 1320, 0.14, 0.1, 0.07); },
+  pearl: () => [1047, 1319, 1568, 2093].forEach((f, i) => tone('triangle', f, f, 0.12, 0.1, i * 0.06)),
+  bonk:  () => { tone('triangle', 220, 45, 0.35, 0.35); tone('square', 120, 40, 0.18, 0.08); },
+  select: () => { tone('sine', 660, 990, 0.1, 0.12); },
+  ink:    () => { tone('sawtooth', 900, 150, 0.25, 0.08); tone('sine', 200, 90, 0.3, 0.2); },
+  levelUp: () => { tone('triangle', 440, 880, 0.18, 0.12); tone('triangle', 660, 1320, 0.22, 0.12, 0.15); },
+  power: () => [523, 659, 784, 1047, 1319].forEach((f, i) => tone('square', f, f, 0.1, 0.06, i * 0.07)),
+  gulp:  () => { tone('sine', 320, 70, 0.3, 0.35); tone('sine', 500, 1100, 0.15, 0.12, 0.32); },
+  chomp: () => { tone('square', 420, 70, 0.1, 0.2); tone('triangle', 110, 45, 0.3, 0.35, 0.06); },
+  warn:  () => { tone('sawtooth', 165, 160, 0.22, 0.12); tone('sawtooth', 175, 170, 0.3, 0.12, 0.28); }
+};
+
+// ===== Actions =====
+function action() {
+  initAudio();
+  if (state === 'menu') { reset(); state = 'play'; swim(); }
+  else if (state === 'play') swim();
+  else if (state === 'over' && time - overTime > RESTART_DELAY + panelDelay()) { reset(); state = 'play'; swim(); }
+}
+
+function swim() {
+  fish.vy = SWIM;
+  sfx.swim();
+  for (let i = 0; i < 3; i++) {
+    particles.push({ kind: 'bubble', x: FISH_X - 18, y: fish.y + rand(-4, 6), vx: -speed() * 0.5 + rand(-20, 10), vy: rand(-40, -10), r: rand(1.5, 3.5), life: rand(0.6, 1), max: 1 });
+  }
+}
+
+function crash(cause = 'crash') {
+  state = 'over'; overTime = time; fish.dead = true; crashCause = cause;
+  if (shark && shark.phase === 'warn') shark = null;
+  if (cause === 'shark') {
+    fish.eaten = true; fish.eatenT = 0;
+    shark.ate = true; shark.ateAt = time;
+    shakeT = 0.3;
+    sfx.chomp();
+  } else {
+    fish.vy = Math.min(fish.vy, -120);
+    sfx.bonk();
+  }
+  for (let i = 0; i < 12; i++) {
+    particles.push({ kind: 'bubble', x: FISH_X, y: fish.y, vx: rand(-90, 90), vy: rand(-140, -20), r: rand(2, 5), life: rand(0.5, 1.1), max: 1.1 });
+  }
+  if (score > best) { best = score; newBest = true; store.set('fishyDash.best', String(best)); }
+}
+
+// Pearl power: the fish swallows the shark instead of being eaten
+function eatShark() {
+  shark.phase = 'gulp'; shark.gulpT = 0; shark.fromX = shark.x; shark.fromY = shark.y;
+  pearls = 0; score += SHARK_EAT_POINTS;
+  fish.bulge = BULGE_TIME; shakeT = 0.3;
+  sfx.gulp();
+  popups.push({ x: FISH_X + 30, y: fish.y - 30, text: '+' + SHARK_EAT_POINTS, life: 0.9 });
+  for (let i = 0; i < 16; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(80, 200);
+    particles.push({ kind: 'spark', x: FISH_X + 20, y: fish.y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, r: rand(1.5, 3.5), life: rand(0.4, 0.8), max: 0.8 });
+  }
+}
+
+function panelDelay() { return crashCause === 'shark' ? EATEN_PANEL_DELAY : 0; }
+
+function toggleMute() {
+  muted = !muted;
+  store.set('fishyDash.muted', muted ? '1' : '0');
+}
+
+// ===== Update =====
+function pearlPos(o) {
+  return { x: o.x + OBS_W / 2 + (o.pearl.dx || 0), y: o.gapY + o.pearl.dy + Math.sin(time * 3 + o.x * 0.01) * 3 };
+}
+
+function circleRect(cx, cy, r, rx, ry, rw, rh, inset = 3) {
+  rx += inset; ry += inset; rw -= inset * 2; rh -= inset * 2;
+  const nx = clamp(cx, rx, rx + rw), ny = clamp(cy, ry, ry + rh);
+  return (cx - nx) ** 2 + (cy - ny) ** 2 < r * r;
+}
+
+// Shark: waits until score >= SHARK_MIN_SCORE, warns at the fish's height, then charges across
+function updateShark(dt) {
+  if (!shark) {
+    if (state !== 'play' || score < SHARK_MIN_SCORE) return;
+    sharkTimer -= dt;
+    if (sharkTimer <= 0) {
+      shark = { phase: 'warn', t: sharkWarnTime(), x: W + 60, y: clamp(fish.y, 40, H - GROUND - 40), tail: 0, mouth: 0.15, ate: false, ateAt: 0 };
+      sfx.warn();
+    }
+    return;
+  }
+  shark.tail += dt * 14;
+  if (shark.phase === 'warn') {
+    shark.t -= dt;
+    if (shark.t <= 0) shark.phase = 'swim';
+    return;
+  }
+  if (shark.phase === 'gulp') {
+    shark.gulpT += dt;
+    if (shark.gulpT >= GULP_TIME) { shark = null; sharkTimer = sharkInterval(); }
+    return;
+  }
+  shark.x -= SHARK_SPEED_MULT * speed() * dt;
+  if (shark.x < -90) { shark = null; sharkTimer = sharkInterval(); return; }
+
+  // Jaws gape when the fish is close, then snap shut after the bite
+  const near = !shark.harmless && shark.x - 48 - FISH_X < 110 && Math.abs(shark.y - fish.y) < 70;
+  const target = shark.ate ? 0 : near ? 1 : 0.15;
+  shark.mouth += (target - shark.mouth) * Math.min(1, dt * (shark.ate ? 30 : 10));
+  if (shark.ate && time - shark.ateAt < 0.5 && Math.random() < 0.3) {
+    particles.push({ kind: 'bubble', x: shark.x - 15, y: shark.y - 4, vx: rand(-20, 40), vy: rand(-80, -30), r: rand(1.5, 4), life: rand(0.5, 0.9), max: 0.9 });
+  }
+
+  if (state === 'play' && !shark.harmless && !isInvincible() && SHARK_HITBOX.some(([dx, r]) =>
+      (shark.x + dx - FISH_X) ** 2 + (shark.y - fish.y) ** 2 < (r + FISH_R - 3) ** 2)) {
+    if (isCharged()) eatShark();
+    else if (!tryInkEscape()) crash('shark');
+  }
+}
+
+function update(dt) {
+  time += dt;
+  updateShark(dt);
+
+  // Background bubbles always drift up
+  for (const b of bubbles) {
+    b.y -= b.speed * dt;
+    b.x += Math.sin(time + b.phase) * 0.2 - (state === 'play' ? speed() * 0.2 * dt : 0);
+    if (b.y < -10 || b.x < -10) Object.assign(b, makeBubble(false));
+  }
+
+  if (state === 'menu') {
+    groundX += SPEED * 0.5 * dt;
+    fish.y = H * 0.42 + Math.sin(time * 3) * 12;
+    fish.tail += dt * 8;
+    fish.angle = Math.cos(time * 3) * 0.12;
+  }
+
+  if (state === 'play') {
+    const v = speed();
+    groundX += v * dt;
+    for (const o of obstacles) o.x -= v * dt;
+    const last = obstacles[obstacles.length - 1];
+    if (last.x < W - SPACING + OBS_W) spawnObstacle(last.x + SPACING);
+    obstacles = obstacles.filter(o => o.x + OBS_W > -20);
+  }
+
+  shakeT = Math.max(0, shakeT - dt);
+  fish.bulge = Math.max(0, fish.bulge - dt);
+
+  // Level up every LEVEL_EVERY points until the ramp maxes out
+  bannerT = Math.max(0, bannerT - dt);
+  const lvl = Math.min(Math.floor(score / LEVEL_EVERY), RAMP_SCORE / LEVEL_EVERY);
+  if (state === 'play' && lvl > level) { level = lvl; bannerT = 1.4; sfx.levelUp(); }
+  if (fish.eaten) fish.eatenT += dt;
+
+  // Charged fish: gapes at an incoming shark, and sparkles
+  const prey = shark && isCharged() && shark.phase === 'swim' && shark.x - 48 - FISH_X < 120 && Math.abs(shark.y - fish.y) < 70;
+  const gulping = shark && shark.phase === 'gulp' && shark.gulpT < GULP_TIME * 0.7;
+  fish.mouth += ((prey || gulping ? 1 : 0) - fish.mouth) * Math.min(1, dt * 14);
+  if (state === 'play' && isCharged() && Math.random() < 0.25) {
+    particles.push({ kind: 'spark', x: FISH_X + rand(-22, 22), y: fish.y + rand(-18, 18), vx: rand(-60, -20), vy: rand(-30, 10), r: rand(1, 2.2), life: rand(0.3, 0.6), max: 0.6 });
+  }
+  if ((state === 'play' || state === 'over') && !fish.eaten) {
+    const floor = H - GROUND - FISH_R;
+    fish.vy = Math.min(fish.vy + GRAVITY * dt, MAX_FALL);
+    fish.y += fish.vy * dt;
+    if (state === 'over' && fish.y >= floor) { fish.y = floor; fish.vy = 0; }
+    fish.tail += dt * (fish.vy < 0 ? 22 : 9) * (fish.dead ? 0.2 : 1);
+    const target = fish.dead ? 0.3 : clamp(fish.vy / 600, -0.5, 0.9);
+    fish.angle += (target - fish.angle) * Math.min(1, dt * 10);
+  }
+
+  if (state === 'play') {
+    // Scoring and pearls
+    for (const o of obstacles) {
+      if (!o.passed && o.x + OBS_W < FISH_X - FISH_R) { o.passed = true; score++; sfx.point(); }
+      if (o.pearl && !o.pearl.taken) {
+        const p = pearlPos(o);
+        if ((p.x - FISH_X) ** 2 + (p.y - fish.y) ** 2 < (FISH_R + PEARL_R) ** 2) {
+          o.pearl.taken = true; score += PEARL_POINTS; sfx.pearl();
+          popups.push({ x: p.x, y: p.y, text: '+' + PEARL_POINTS, life: 0.9 });
+          if (pearls < POWER_PEARLS && ++pearls === POWER_PEARLS) {
+            sfx.power();
+            popups.push({ x: FISH_X + 10, y: fish.y - 40, text: 'POWER!', life: 0.9 });
+          }
+          for (let i = 0; i < 10; i++) {
+            const a = rand(0, Math.PI * 2), s = rand(60, 160);
+            particles.push({ kind: 'spark', x: p.x, y: p.y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, r: rand(1.5, 3), life: rand(0.3, 0.6), max: 0.6 });
+          }
+        }
+      }
+    }
+    // Collisions: surface, seabed, coral and kelp
+    updateAbility(dt);
+    let hit = fish.y - FISH_R < 0 || fish.y + FISH_R > H - GROUND, hitObstacle = null;
+    for (const o of obstacles) {
+      if (circleRect(FISH_X, fish.y, FISH_R, o.x, -100, OBS_W, o.gapY - o.gap / 2 + 100) ||
+          circleRect(FISH_X, fish.y, FISH_R, o.x, o.gapY + o.gap / 2, OBS_W, H)) { hit = true; hitObstacle = o; }
+    }
+    if (isInvincible()) keepInBounds();
+    else if (hit && !tryRegrow(hitObstacle)) crash();
+  }
+
+  for (const p of particles) {
+    p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.kind === 'bubble') p.vy -= 30 * dt;
+    else if (p.kind === 'ink') { p.r += 30 * dt; p.vx *= 0.97; p.vy *= 0.97; }
+    else p.vy += 200 * dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+  for (const t of popups) { t.life -= dt; t.y -= 40 * dt; }
+  popups = popups.filter(t => t.life > 0);
+}
+
+// ===== Drawing =====
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+
+function text(str, x, y, size, color, align = 'center') {
+  ctx.font = `bold ${size}px "Trebuchet MS", system-ui, sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillStyle = 'rgba(0, 20, 40, 0.6)';
+  ctx.fillText(str, x + 2, y + 3);
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0a5a8a'); g.addColorStop(0.5, '#05305a'); g.addColorStop(1, '#021a33');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // Light rays from the surface
+  for (let i = 0; i < 5; i++) {
+    ctx.fillStyle = `rgba(180, 230, 255, ${0.05 + 0.03 * Math.sin(time * 0.8 + i * 1.7)})`;
+    const x = 30 + i * 90 + Math.sin(time * 0.3 + i) * 15;
+    ctx.beginPath();
+    ctx.moveTo(x, 0); ctx.lineTo(x + 30, 0);
+    ctx.lineTo(x + 110, H - GROUND); ctx.lineTo(x + 40, H - GROUND);
+    ctx.closePath(); ctx.fill();
+  }
+
+  // Distant rocks (parallax)
+  ctx.fillStyle = 'rgba(2, 30, 55, 0.8)';
+  ctx.beginPath(); ctx.moveTo(0, H - GROUND);
+  for (let x = 0; x <= W; x += 10) {
+    const wx = x + groundX * 0.3;
+    ctx.lineTo(x, H - GROUND - 40 - Math.sin(wx * 0.012) * 25 - Math.sin(wx * 0.031) * 12);
+  }
+  ctx.lineTo(W, H - GROUND); ctx.closePath(); ctx.fill();
+
+  ctx.strokeStyle = 'rgba(200, 240, 255, 0.35)'; ctx.lineWidth = 1.2;
+  for (const b of bubbles) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.stroke(); }
+}
+
+function drawGround() {
+  const top = H - GROUND;
+  const g = ctx.createLinearGradient(0, top, 0, H);
+  g.addColorStop(0, '#e3c27a'); g.addColorStop(1, '#a07a3a');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.moveTo(0, H); ctx.lineTo(0, top);
+  for (let x = 0; x <= W; x += 8) ctx.lineTo(x, top + Math.sin((x + groundX) * 0.05) * 3);
+  ctx.lineTo(W, H); ctx.closePath(); ctx.fill();
+
+  const off = groundX % 64;
+  for (let x = -off; x < W + 64; x += 64) {
+    ctx.fillStyle = 'rgba(120, 85, 40, 0.6)';
+    ctx.beginPath(); ctx.ellipse(x + 12, top + 22, 5, 3, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + 40, top + 44, 4, 2.5, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255, 240, 200, 0.5)';
+    circle(x + 28, top + 30, 1.5);
+  }
+}
+
+function drawCoral(x, top) {
+  const bottom = H - GROUND + 6;
+  const g = ctx.createLinearGradient(x, 0, x + OBS_W, 0);
+  g.addColorStop(0, '#c2185b'); g.addColorStop(0.5, '#ff6f91'); g.addColorStop(1, '#ad1457');
+  ctx.fillStyle = g;
+  roundRect(x, top + 10, OBS_W, bottom - top - 10, 10); ctx.fill();
+  for (let i = 0; i < 3; i++) circle(x + 12 + i * 24, top + 14, 14);
+  for (let y = top + 40; y < bottom - 10; y += 34) { circle(x + 2, y, 7); circle(x + OBS_W - 2, y + 17, 7); }
+  ctx.fillStyle = 'rgba(255, 220, 230, 0.55)';
+  for (let y = top + 30; y < bottom - 10; y += 22) circle(x + 18 + ((y / 22 | 0) % 2) * 30, y, 3.5);
+}
+
+function leaf(x, y, rot) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
+  ctx.beginPath(); ctx.ellipse(0, 0, 6, 15, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawKelp(x, bottom) {
+  const g = ctx.createLinearGradient(x, 0, x + OBS_W, 0);
+  g.addColorStop(0, '#1b5e20'); g.addColorStop(0.5, '#43a047'); g.addColorStop(1, '#1b5e20');
+  ctx.fillStyle = g;
+  roundRect(x, -20, OBS_W, bottom + 20 - 8, 12); ctx.fill();
+  for (let i = 0; i < 3; i++) circle(x + 12 + i * 24, bottom - 12, 12);
+
+  const sway = Math.sin(time * 2 + x * 0.03) * 0.25;
+  ctx.fillStyle = '#66bb6a';
+  for (let y = bottom - 40; y > 0; y -= 36) { leaf(x + 2, y, -0.9 + sway); leaf(x + OBS_W - 2, y - 18, 0.9 + sway); }
+
+  ctx.strokeStyle = 'rgba(165, 214, 167, 0.35)'; ctx.lineWidth = 3;
+  for (const k of [0.3, 0.7]) {
+    ctx.beginPath(); ctx.moveTo(x + OBS_W * k, 0); ctx.lineTo(x + OBS_W * k, bottom - 14); ctx.stroke();
+  }
+}
+
+function drawPearl(x, y) {
+  ctx.save();
+  ctx.shadowColor = '#ffffff'; ctx.shadowBlur = 14 + Math.sin(time * 5) * 4;
+  const g = ctx.createRadialGradient(x - 3, y - 3, 1, x, y, PEARL_R);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(0.6, '#f3e5ff'); g.addColorStop(1, '#bba6dd');
+  ctx.fillStyle = g; circle(x, y, PEARL_R);
+  ctx.restore();
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.9)'; circle(x - 3, y - 3, 2.2);
+}
+
+function drawFish() {
+  let x = FISH_X, y = fish.y, s = 1;
+  if (fish.eaten) {                                              // pulled into the jaws and shrinks away
+    s = 1 - fish.eatenT / SWALLOW_TIME;
+    if (s <= 0 || !shark) return;
+    const k = Math.min(1, fish.eatenT / SWALLOW_TIME * 2);
+    x += (shark.x - 38 - x) * k; y += (shark.y + 6 - y) * k;
+  } else {                                                       // charged = slightly bigger; belly bulges after a gulp
+    s = (isCharged() && !fish.dead ? 1.08 : 1) * (1 + 0.35 * Math.sin(Math.PI * fish.bulge / BULGE_TIME));
+  }
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(fish.angle); ctx.scale(s, s);
+  if (isCharged() && !fish.dead) {                               // golden power aura
+    const a = 0.45 + 0.2 * Math.sin(time * 8);
+    const glow = ctx.createRadialGradient(0, 0, 8, 0, 0, 38);
+    glow.addColorStop(0, `rgba(255, 215, 90, ${a})`); glow.addColorStop(1, 'rgba(255, 215, 90, 0)');
+    ctx.fillStyle = glow; circle(0, 0, 38);
+  }
+  if (fish.dead) ctx.scale(1, -1);
+  if (isInvincible() && Math.sin(time * 30) > 0) ctx.globalAlpha = 0.4;   // Stella's regrow blink
+  CHARACTERS[charId].draw({
+    tail: fish.tail, mouth: fish.mouth, dead: fish.dead,
+    arms: charId === 'stella' && !ability.ready ? 4 : 5
+  });
+  ctx.restore();
+}
+
+function drawShark() {
+  if (!shark) return;
+  if (shark.phase === 'warn') {
+    if (Math.sin(time * 18) > -0.2) {
+      if (isCharged()) {                                         // dinner is coming
+        ctx.fillStyle = 'rgba(46, 204, 113, 0.95)'; circle(W - 28, shark.y, 17);
+        ctx.font = '20px "Segoe UI Emoji", "Apple Color Emoji", sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText('🍴', W - 28, shark.y + 1);
+      } else {
+        ctx.fillStyle = 'rgba(255, 60, 60, 0.9)'; circle(W - 28, shark.y, 16);
+        text('!', W - 28, shark.y + 1, 24, '#ffffff');
+      }
+    }
+    return;
+  }
+  const sw = Math.sin(shark.tail) * 8;
+  let sx = shark.x, sy = shark.y, ss = 1;
+  if (shark.phase === 'gulp') {                                  // shrinks nose-first into the fish's mouth
+    const k = shark.gulpT / GULP_TIME, m = Math.min(1, k * 3);
+    ss = Math.max(0.05, 1 - k);
+    sx = shark.fromX + (FISH_X + 20 + 50 * ss - shark.fromX) * m;
+    sy = shark.fromY + (fish.y + 4 - shark.fromY) * m;
+  }
+  ctx.save();
+  ctx.translate(sx, sy); ctx.scale(ss, ss);                      // faces left
+
+  ctx.fillStyle = '#5f7686';                                     // tail + dorsal fin
+  ctx.beginPath(); ctx.moveTo(38, 0); ctx.lineTo(70, -22 + sw); ctx.lineTo(60, sw * 0.4); ctx.lineTo(70, 18 + sw); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-6, -15); ctx.lineTo(10, -40); ctx.lineTo(20, -13); ctx.closePath(); ctx.fill();
+
+  const g = ctx.createLinearGradient(0, -18, 0, 18);             // body, pale belly
+  g.addColorStop(0, '#7f97a8'); g.addColorStop(0.55, '#8fa6b6'); g.addColorStop(0.56, '#e8eef2'); g.addColorStop(1, '#cfd9df');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.ellipse(0, 0, 50, 18, 0, 0, Math.PI * 2); ctx.fill();
+
+  ctx.fillStyle = '#6c8494';                                     // pectoral fin
+  ctx.beginPath(); ctx.moveTo(-8, 8); ctx.lineTo(4, 28); ctx.lineTo(10, 8); ctx.closePath(); ctx.fill();
+
+  ctx.strokeStyle = 'rgba(40, 60, 75, 0.5)'; ctx.lineWidth = 1.5; // gills
+  for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.moveTo(-22 + i * 5, -6); ctx.lineTo(-24 + i * 5, 6); ctx.stroke(); }
+
+  ctx.fillStyle = '#111'; circle(-34, -6, 3);                    // eye
+  if (shark.harmless) {                                          // blinded by Inky's ink
+    ctx.fillStyle = 'rgba(45, 20, 70, 0.85)';
+    circle(-36, -6, 8); circle(-28, -9, 6); circle(-42, -1, 5); circle(-24, -2, 4);
+  }
+
+  const open = shark.mouth, jawY = 6 + 16 * open;              // mouth: lower jaw drops as it opens
+  ctx.fillStyle = '#5a1d26';
+  ctx.beginPath(); ctx.moveTo(-50, 2); ctx.lineTo(-20, 5); ctx.lineTo(-46, jawY); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#dfe7ec';
+  ctx.beginPath(); ctx.moveTo(-46, jawY); ctx.lineTo(-20, 5); ctx.lineTo(-18, 12); ctx.lineTo(-42, jawY + 5); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#ffffff';                                     // teeth on both jaws
+  for (let i = 0; i < 5; i++) {
+    const t = i / 5;
+    const ux = -48 + 24 * t, uy = 2.3 + 2.7 * t;
+    ctx.beginPath(); ctx.moveTo(ux, uy); ctx.lineTo(ux + 2.4, uy + 3.5 + open); ctx.lineTo(ux + 4.8, uy + 0.4); ctx.fill();
+    if (open > 0.2) {
+      const lx = -46 + 24 * t, ly = jawY + (5 - jawY) * t;
+      ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(lx + 2.4, ly - 3.5); ctx.lineTo(lx + 4.8, ly - 0.4); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const a = clamp(p.life / p.max, 0, 1);
+    if (p.kind === 'bubble') {
+      ctx.strokeStyle = `rgba(220, 245, 255, ${a * 0.8})`; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.stroke();
+    } else if (p.kind === 'ink') {
+      continue;                                                  // drawn on top of everything by drawInk()
+    } else {
+      ctx.fillStyle = `rgba(255, 245, 210, ${a})`; circle(p.x, p.y, p.r);
+    }
+  }
+  for (const t of popups) {
+    ctx.globalAlpha = clamp(t.life / 0.9, 0, 1);
+    text(t.text, t.x, t.y, 22, '#fff4c2');
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawInk() {
+  for (const p of particles) {
+    if (p.kind !== 'ink') continue;
+    ctx.fillStyle = `rgba(40, 18, 60, ${clamp(p.life / p.max, 0, 1) * 0.75})`; circle(p.x, p.y, p.r);
+  }
+}
+
+function drawMuteButton() {
+  const { x, y, w, h } = MUTE_BTN;
+  ctx.fillStyle = 'rgba(0, 30, 60, 0.45)'; roundRect(x, y, w, h, 10); ctx.fill();
+  const cx = x + 13, cy = y + h / 2;
+  ctx.fillStyle = '#e6f7ff';
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, cy - 4); ctx.lineTo(cx - 2, cy - 4); ctx.lineTo(cx + 4, cy - 9);
+  ctx.lineTo(cx + 4, cy + 9); ctx.lineTo(cx - 2, cy + 4); ctx.lineTo(cx - 6, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#e6f7ff'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  if (muted) {
+    ctx.moveTo(cx + 9, cy - 5); ctx.lineTo(cx + 18, cy + 5); ctx.moveTo(cx + 18, cy - 5); ctx.lineTo(cx + 9, cy + 5);
+  } else {
+    ctx.arc(cx + 6, cy, 6, -0.9, 0.9); ctx.moveTo(cx + 9.4, cy - 9.7); ctx.arc(cx + 6, cy, 11, -1.0, 1.0);
+  }
+  ctx.stroke();
+}
+
+function drawPowerMeter() {
+  for (let i = 0; i < POWER_PEARLS; i++) {
+    const x = 26 + i * 26, y = 33;
+    if (i < pearls) drawPearl(x, y);
+    else {
+      ctx.strokeStyle = 'rgba(230, 245, 255, 0.5)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y, PEARL_R, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+  if (isCharged() && Math.sin(time * 6) > -0.4) text('POWER!', 17, 60, 16, '#ffd166', 'left');
+}
+
+function drawLevelBanner() {
+  if (bannerT <= 0) return;
+  const maxed = level >= RAMP_SCORE / LEVEL_EVERY;
+  const pop = 1 + 0.25 * Math.max(0, (bannerT - 1.2) / 0.2);   // quick pop-in, then hold and fade
+  ctx.save();
+  ctx.globalAlpha = Math.min(1, bannerT / 0.4);
+  ctx.translate(W / 2, 150); ctx.scale(pop, pop);
+  text(maxed ? 'MAX SPEED!' : 'Faster!', 0, 0, 34, maxed ? '#ff8fa3' : '#7ee8ff');
+  ctx.restore();
+}
+
+function drawGameOver() {
+  const since = time - overTime - panelDelay();
+  if (since < 0) return;
+  const t = clamp(since / 0.4, 0, 1);
+  ctx.globalAlpha = t;
+  ctx.fillStyle = 'rgba(2, 21, 38, 0.5)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(8, 50, 90, 0.92)'; roundRect(W / 2 - 140, H / 2 - 160, 280, 280, 20); ctx.fill();
+  ctx.strokeStyle = 'rgba(120, 210, 255, 0.5)'; ctx.lineWidth = 2; ctx.stroke();
+  text(crashCause === 'shark' ? 'Chomped!' : 'Game Over', W / 2, H / 2 - 115, 40, '#ff8fa3');
+  text('Score', W / 2, H / 2 - 60, 18, '#cfefff');
+  text(String(score), W / 2, H / 2 - 28, 40, '#ffffff');
+  text(`Best: ${best}`, W / 2, H / 2 + 20, 22, '#ffd166');
+  if (newBest) {
+    ctx.save();
+    ctx.translate(W / 2, H / 2 + 58); const s = 1 + Math.sin(time * 8) * 0.08; ctx.scale(s, s);
+    text('New best!', 0, 0, 24, '#ffe066');
+    ctx.restore();
+  }
+  if (since > RESTART_DELAY && Math.sin(time * 4) > -0.3) text('Tap to try again', W / 2, H / 2 + 95, 18, '#ffffff');
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.save();
+  if (shakeT > 0) {                                              // chomp screen shake (world only, not the UI)
+    const m = 8 * shakeT / 0.3;
+    ctx.fillStyle = '#021a33'; ctx.fillRect(0, 0, W, H);
+    ctx.translate(rand(-m, m), rand(-m, m));
+  }
+  drawBackground();
+  for (const o of obstacles) {
+    drawKelp(o.x, o.gapY - o.gap / 2);
+    drawCoral(o.x, o.gapY + o.gap / 2);
+    if (o.pearl && !o.pearl.taken) { const p = pearlPos(o); drawPearl(p.x, p.y); }
+  }
+  drawGround();
+  drawParticles();
+  if (fish.eaten) { drawFish(); drawShark(); }                  // swallowed fish disappears inside the head
+  else if (state !== 'menu') { drawShark(); drawFish(); }
+  drawInk();
+  ctx.restore();
+  if (state === 'menu') drawCharacterSelect();
+  if (state === 'play') { text(String(score), W / 2, 70, 56, '#ffffff'); drawPowerMeter(); drawAbilityHUD(); drawLevelBanner(); }
+  if (state === 'over') drawGameOver();
+  drawMuteButton();
+}
+
+// ===== Input =====
+function toWorld(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const p = toWorld(e), b = MUTE_BTN;
+  if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) { toggleMute(); return; }
+  if (state === 'menu') {                                        // tap a card to pick; tap it again (or PLAY) to start
+    initAudio();
+    const id = cardAt(p);
+    if (id && id !== charId) { selectChar(id); return; }
+  }
+  action();
+});
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'Enter') {
+    e.preventDefault();
+    if (!e.repeat) action();
+  } else if (state === 'menu' && (e.code === 'ArrowLeft' || e.code === 'KeyA')) { initAudio(); cycleChar(-1); }
+  else if (state === 'menu' && (e.code === 'ArrowRight' || e.code === 'KeyD')) { initAudio(); cycleChar(1); }
+  else if (e.code === 'KeyM') toggleMute();
+});
+
+// ===== Sizing & loop =====
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H) * 0.98;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = W * s + 'px'; canvas.style.height = H * s + 'px';
+  canvas.width = Math.round(W * s * dpr); canvas.height = Math.round(H * s * dpr);
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+}
+window.addEventListener('resize', resize);
+
+let last = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min(0.1, (now - last) / 1000); last = now;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+reset();
+resize();
+requestAnimationFrame(frame);
+
+// Offline support when served from a website (skipped when opened as a local file)
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>
